@@ -423,7 +423,216 @@ Modèle de test : **Qwopus3.5-9B-v3 Q4_K_M** (Qwen3.5-9B distillé sur Claude Op
 
 > ⚠️ **Note version Ollama** : il faut une version récente d'Ollama pour les architectures modernes comme `qwen35` (Qwen3.5). Une version trop ancienne renvoie `unknown model architecture: 'qwen35'`. Mettre à jour avec `curl -fsSL https://ollama.com/install.sh | sh`, puis re-vérifier que les 3 variables d'environnement sont toujours présentes (l'installeur peut réécrire le service).
 
-> ⚠️ **Limite mémoire Vulkan** : sur cet APU, Vulkan n'expose qu'environ **7,9 Go** sur les 16 Go unifiés. Suffisant pour un modèle 9B en Q4 (~5,6 Go) avec un contexte raisonnable, mais pas pour des modèles plus gros sans ajustement.
+> ⚠️ **Limite mémoire Vulkan par défaut** : sur cet APU, Vulkan n'expose qu'environ **7,9 Go** sur les 16 Go unifiés. Suffisant pour un modèle 9B en Q4, mais insuffisant pour des modèles 12B+ ou un grand contexte. Voir la section suivante pour débloquer toute la mémoire.
+
+---
+
+## Étendre la mémoire GPU disponible (GTT/TTM)
+
+Par défaut, Vulkan ne voit que ~7,9 Go des 16 Go physiques du BC-250. On peut porter cette limite à **~14,5 Go** en ajustant les paramètres kernel GTT (Graphics Translation Table) et TTM (Translation Table Manager) via GRUB.
+
+### Calcul de la valeur
+
+14,5 Go × 1024 × 1024 / 4096 (taille d'une page) = **3 801 088 pages**
+
+### Appliquer le paramètre
+
+```bash
+nano /etc/default/grub
+```
+
+Modifier la ligne `GRUB_CMDLINE_LINUX_DEFAULT` :
+
+```
+GRUB_CMDLINE_LINUX_DEFAULT="quiet ttm.pages_limit=3801088 ttm.page_pool_size=3801088"
+```
+
+> ⚠️ **Syntaxe critique** : un seul guillemet ouvrant et un seul fermant. Une erreur de guillemet cause `Syntax error: EOF in backquote substitution` au moment de `grub-mkconfig`.
+
+Régénérer la config GRUB :
+
+```bash
+# Sur Debian Trixie, update-grub n'existe pas — utiliser directement :
+/usr/sbin/grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+Redémarrer :
+
+```bash
+systemctl reboot -i
+```
+
+### Vérification après reboot
+
+```bash
+dmesg | grep -i "GTT memory ready"
+# Attendu : ~14848M of GTT memory ready
+
+# Ollama doit maintenant voir ~14 GiB :
+journalctl -u ollama --no-pager | grep -i "Vulkan0" | tail -1
+# total="14.x GiB"
+```
+
+### ⚠️ Précaution mémoire partagée
+
+Sur le BC-250, CPU et GPU **partagent** la même RAM physique. Si tu alloues 14,5 Go au GPU, il ne reste que ~1,5 Go pour l'OS et les autres processus. 
+
+Recommandations selon l'usage :
+
+| Usage | GTT conseillé | Reste OS |
+|-------|--------------|----------|
+| Ollama seul (headless) | 14,5 Go | ~1,5 Go (suffisant) |
+| Ollama + Docker (stack IA) | 12 Go | ~4 Go |
+| Modèle 12B + contexte 75k | 14,5 Go | surveiller `free -h` |
+
+**Surveiller la mémoire système pendant l'inférence :**
+
+```bash
+watch -n 1 free -h
+```
+
+Si la colonne `available` descend sous ~200 Mo, le risque d'OOM-kill est élevé — réduire le contexte ou le GTT.
+
+---
+
+## Config Ollama complète pour serveur headless
+
+Configuration recommandée pour un BC-250 dédié Ollama (serveur en armoire réseau, accès via SSH, sans écran).
+
+### Variables d'environnement complètes
+
+```bash
+systemctl edit ollama
+```
+
+```ini
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="OLLAMA_VULKAN=1"
+Environment="OLLAMA_IGPU_ENABLE=1"
+Environment="ROCR_VISIBLE_DEVICES="
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+Environment="OLLAMA_CONTEXT_LENGTH=8192"
+```
+
+| Variable | Valeur | Rôle |
+|----------|--------|------|
+| `OLLAMA_HOST` | `0.0.0.0:11434` | Expose Ollama sur tout le réseau (pas juste localhost) |
+| `OLLAMA_VULKAN` | `1` | Active le backend Vulkan |
+| `OLLAMA_IGPU_ENABLE` | `1` | Autorise le GPU à mémoire unifiée |
+| `ROCR_VISIBLE_DEVICES` | *(vide)* | Désactive ROCm (plante sur gfx1013) |
+| `OLLAMA_FLASH_ATTENTION` | `1` | Réduit la mémoire du cache d'attention |
+| `OLLAMA_KV_CACHE_TYPE` | `q8_0` | Quantifie le KV cache (~50% mémoire économisée) |
+| `OLLAMA_CONTEXT_LENGTH` | `8192` | Contexte par défaut (ajuster selon les modèles) |
+
+```bash
+systemctl daemon-reload
+systemctl restart ollama
+```
+
+### Vérifier l'exposition réseau
+
+```bash
+ss -tlnp | grep 11434
+# Doit afficher : 0.0.0.0:11434 (et non 127.0.0.1)
+```
+
+### Créer un modèle avec contexte étendu (Modelfile)
+
+```bash
+cat > /tmp/Modelfile << 'EOF'
+FROM gemma4:12b
+PARAMETER num_ctx 32000
+PARAMETER num_gpu 99
+EOF
+
+ollama create gemma4-12b-optimized -f /tmp/Modelfile
+ollama run gemma4-12b-optimized --verbose
+```
+
+### Performances mesurées — Gemma 4 12B, contexte 75k, 40 CU
+
+| Métrique | Valeur |
+|----------|--------|
+| Prompt eval | **101 tok/s** |
+| Génération | **~25 tok/s** |
+| Température | **~65°C** |
+| Conso au repos | **~52W** |
+| Conso sous charge | **~125-150W** |
+
+### Surveiller la consommation électrique
+
+```bash
+watch -n 1 "cat /sys/class/hwmon/hwmon*/power1_input 2>/dev/null | awk '{print \$1/1000000 \" W\"}'"
+# 52099000 = 52W (valeur divisée par 1 000 000)
+```
+
+> **Note** : `powerstat` et RAPL ne fonctionnent pas sur le BC-250 (APU non-Intel). Le capteur `hwmon/power1_input` est la seule source fiable.
+
+---
+
+## Governor thermique — configuration avancée
+
+Le governor permet de limiter la fréquence et la tension GPU pour maîtriser la consommation et la température.
+
+### Points de fonctionnement validés
+
+| Fréquence | Tension | Conso GPU | Tok/s (9B) | Temp |
+|-----------|---------|-----------|------------|------|
+| 1500 MHz | 900 mV | ~125W | ~49 tok/s | ~83°C |
+| 1750 MHz | 950 mV | ~150W | ~58 tok/s | ~88°C |
+| 2000 MHz | 1000 mV | ~181W | ~65 tok/s | ~96°C |
+
+**Recommandation production 24/7** : 1500 MHz / 900 mV (stable, thermals maîtrisés).
+
+**Avec alim 300W** : 1750 MHz / 950 mV est envisageable (bon compromis vitesse/thermals).
+
+### Configuration
+
+```bash
+# Installer le governor
+git clone https://github.com/filippor/cyan-skillfish-governor
+cd cyan-skillfish-governor
+pip install . --break-system-packages
+```
+
+```toml
+# /etc/cyan-skillfish-governor/config.toml
+[[safe-points]]
+frequency = 350
+voltage = 700
+
+[[safe-points]]
+frequency = 1500
+voltage = 900
+
+# Optionnel — décommenter pour plus de perf (alim 300W+)
+# [[safe-points]]
+# frequency = 1750
+# voltage = 950
+```
+
+```bash
+# Créer le service systemd manuellement (non créé automatiquement)
+cat > /etc/systemd/system/cyan-skillfish-governor.service << 'EOF'
+[Unit]
+Description=Cyan Skillfish GPU Governor (BC-250)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cyan-skillfish-governor
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable cyan-skillfish-governor
+systemctl start cyan-skillfish-governor
+```
 
 ---
 
